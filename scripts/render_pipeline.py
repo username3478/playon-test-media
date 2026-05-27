@@ -1,12 +1,18 @@
 """
-PuroMMA Reels Render Pipeline — GitHub Actions edition
+PuroMMA Reels Render Pipeline — GitHub Actions edition  (Stage 1b)
 Reads JOB_PAYLOAD from environment, renders 3-beat MP4 with kinetic captions,
-uploads to Cloudflare R2, optionally POSTs result to callback_url.
+ES-ES voiceover (Gemini TTS), uploads to Cloudflare R2, optionally POSTs result
+to callback_url.
 
-Stage 1 scope: news_hook only, music-bed audio, no n8n callback required.
+Stage 1b changes vs Stage 1:
+- ES-ES voiceover via Gemini TTS (Zephyr/Umbriel/Gacrux rotation by wp_post_id % 3)
+- Caption timing driven by TTS audio duration (proportional to word length)
+- Beat 3 on-screen CTA card removed entirely
+- Body beats are complete standalone sentences/phrases, not mid-sentence fragments
+- Music bed kept at vol 0.07, voice at 1.0, amix (same as render_server.py)
 """
 
-import base64, json, os, subprocess, sys, tempfile, time, struct, urllib.request, urllib.error
+import base64, json, os, struct, subprocess, sys, tempfile, time, urllib.request, urllib.error
 
 # ── Env / config ──────────────────────────────────────────────────────────────
 
@@ -18,6 +24,7 @@ R2_PUBLIC_URL   = os.environ['R2_PUBLIC_URL']      # https://pub-xxx.r2.dev
 # (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY — set in GH Actions env block)
 
 GEMINI_FLASH    = 'gemini-3-flash-preview'
+GEMINI_TTS_MODEL = 'gemini-3.1-flash-tts-preview'
 GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models'
 
 # Font path (bundled in repo — Anton Regular, OFL license)
@@ -30,11 +37,52 @@ MUSIC_PATH = os.path.realpath(MUSIC_PATH)
 LOGO_PATH = os.path.join(os.path.dirname(__file__), '..', 'assets', 'puromma_logo.png')
 LOGO_PATH = os.path.realpath(LOGO_PATH)
 
-FPS        = 25
-TOTAL_DUR  = 9.0   # 3 beats × 3s each
-BEAT_DUR   = 3.0
-WORK_W     = 2160  # 2× output resolution for zoompan quality
-WORK_H     = 3840
+FPS      = 25
+BEAT_DUR = 3.0   # seconds per beat (3 beats = 9s minimum; extended to fit TTS)
+WORK_W   = 2160  # 2× output resolution for zoompan quality
+WORK_H   = 3840
+
+# ── TTS voice rotation — peninsular ES-ES, MARCA/COPE energy ──────────────────
+PUROMMA_TTS_VOICES = [
+    {
+        'name':   'Zephyr',
+        'gender': 'female',
+        'style':  (
+            'Lee esto como una analista deportiva española entusiasta — '
+            'energía contagiosa, tono apasionado, amistoso y dinámico. '
+            'CRÍTICO: acento castellano peninsular (Madrid o Barcelona). '
+            'NO acento latinoamericano. NO acento neutro. Pronuncia "z", "ce", '
+            '"ci" como /θ/ (zeta española), distinción entre /s/ y /θ/. '
+            'Voz vibrante, ritmo deportivo, como introduciendo lo más emocionante '
+            'del fin de semana en MARCA TV: '
+        ),
+    },
+    {
+        'name':   'Umbriel',
+        'gender': 'male',
+        'style':  (
+            'Lee esto como un comentarista deportivo español apasionado — '
+            'energía alta, entusiasta, amistoso, sin gritar ni sonar agresivo. '
+            'CRÍTICO: acento castellano peninsular (Madrid o Barcelona). '
+            'NO acento latinoamericano. NO acento neutro. Pronuncia "z", "ce", '
+            '"ci" como /θ/ (zeta española), distinción entre /s/ y /θ/. '
+            'Voz vibrante con clase, como un analista de MARCA o COPE: '
+        ),
+    },
+    {
+        'name':   'Gacrux',
+        'gender': 'male',
+        'style':  (
+            'Lee esto como un comentarista deportivo español veterano — '
+            'voz madura con autoridad, apasionado pero con clase, '
+            'amistoso, sin gritar. CRÍTICO: acento castellano peninsular '
+            '(Madrid o Barcelona). NO acento latinoamericano. NO acento neutro. '
+            'Pronuncia "z", "ce", "ci" como /θ/ (zeta española), distinción '
+            'entre /s/ y /θ/. Tono de analista veterano de MARCA o COPE: '
+        ),
+    },
+]
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -50,6 +98,41 @@ def gemini_json(prompt):
         resp = json.loads(r.read())
     text = resp['candidates'][0]['content']['parts'][0]['text']
     return json.loads(text)
+
+
+def gemini_tts(text, voice, style_prefix):
+    """Call Gemini TTS, return (pcm_bytes, sample_rate)."""
+    url = f'{GEMINI_API_BASE}/{GEMINI_TTS_MODEL}:generateContent?key={GEMINI_KEY}'
+    payload = {
+        'contents': [{'parts': [{'text': style_prefix + text}]}],
+        'generationConfig': {
+            'responseModalities': ['AUDIO'],
+            'speechConfig': {'voiceConfig': {'prebuiltVoiceConfig': {'voiceName': voice}}},
+        },
+    }
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        resp = json.loads(r.read())
+    part = next(p for p in resp['candidates'][0]['content']['parts'] if 'inlineData' in p)
+    mime = part['inlineData']['mimeType']
+    raw  = base64.b64decode(part['inlineData']['data'])
+    rate = 24000
+    for chunk in mime.split(';'):
+        if 'rate=' in chunk:
+            rate = int(chunk.split('=')[1])
+    return raw, rate
+
+
+def pcm_to_wav(pcm, sr, channels=1, bits=16):
+    byte_rate   = sr * channels * bits // 8
+    block_align = channels * bits // 8
+    data_size   = len(pcm)
+    header = b'RIFF' + struct.pack('<I', 36 + data_size) + b'WAVE'
+    fmt    = b'fmt ' + struct.pack('<IHHIIHH', 16, 1, channels, sr,
+                                   byte_rate, block_align, bits)
+    data_c = b'data' + struct.pack('<I', data_size)
+    return header + fmt + data_c + pcm
 
 
 def audio_duration(path):
@@ -82,9 +165,8 @@ def ffprobe_image_dims(path):
 
 def sanitise_drawtext(s):
     """Escape characters that break FFmpeg drawtext filter."""
-    # Order matters: backslash first, then the rest
     s = s.replace('\\', '\\\\')
-    s = s.replace("'", "’")   # replace straight apostrophe with curly (safe)
+    s = s.replace("'", "’")   # curly apostrophe — safe in drawtext
     s = s.replace(':', '\\:')
     s = s.replace('%', '\\%')
     return s
@@ -94,7 +176,10 @@ def sanitise_drawtext(s):
 
 def generate_content(post_title, image_url, content_type='news_hook'):
     """Call Gemini to produce structured content for the reel.
-    Returns dict with fighter_name, headline, hook_text, cta_text, ig_caption.
+
+    Returns dict with:
+      fighter_name, hook_text, body_beat_1, body_beat_2,
+      voiceover, ig_caption
     """
     prompt = f"""You are a social-media content writer for PuroMMA (puromma.com),
 a Spanish-language MMA site targeting a peninsular Spanish audience (Spain).
@@ -106,21 +191,34 @@ Article title: {post_title}
 Content type: {content_type}
 
 Return ONLY valid JSON with exactly these keys:
+
 - fighter_name: Main fighter's name in ALL CAPS, 1-3 words (e.g. "MCGREGOR")
-- headline: Punchy 3-5 word hook in ALL CAPS (e.g. "SE RETIRA DEL UFC")
-- hook_text: A 5-8 word hook line in ALL CAPS, ES-ES peninsular. Provocative,
-  opens a curiosity gap or delivers a hot take. No call-to-action here.
-  Example: "EL ERROR QUE NADIE OS HA CONTADO"
-- body_text: 1-2 short phrases (total 8-14 words) for beats 2-3. The key fact or angle.
-  Example: "NO SON LOS NÚMEROS QUE PENSÁIS"
-- cta_text: A 8-14 word send/save CTA in sentence case (vosotros imperative).
-  Examples: "Mándale esto al que más defiende a este luchador en vuestro grupo."
-  or "Mandádselo al grupito de MMA antes de que salga más información."
-- ig_caption: Instagram caption in ES-ES, max 180 words before hashtags.
+
+- hook_text: A 5-8 word hook in ALL CAPS, ES-ES peninsular. Provocative — opens a
+  curiosity gap or delivers a hot take. Must be a COMPLETE, grammatical, standalone
+  phrase that makes sense on its own.
+  Example: "LA PREDICCIÓN QUE NADIE QUERÍA OÍR"
+
+- body_beat_1: A COMPLETE, self-contained sentence or phrase in ALL CAPS, 8-14 words.
+  This appears alone on screen — it MUST make full grammatical sense on its own, with
+  no dependency on surrounding beats. No cliffhangers mid-sentence.
+  Example: "MATT BROWN CREE QUE MCGREGOR SE RETIRARÁ SI NO PELEA EN UFC 329"
+
+- body_beat_2: A COMPLETE, self-contained sentence or phrase in ALL CAPS, 8-14 words.
+  Same rules as body_beat_1 — standalone, grammatically complete, no mid-sentence cut.
+  Example: "EL VETERANO AMERICANO DA SU PREDICCIÓN MÁS DEMOLEDORA HASTA LA FECHA"
+
+- voiceover: ~35-45 word natural flowing narration in ES-ES peninsular Spanish.
+  This is spoken aloud — write it as connected, natural speech.
+  Structure: intriguing hook sentence → key fact → teaser for more.
+  End with a natural closing line (e.g. "Esto lo cambia todo." or "La pregunta es cuándo.").
+  NO send/share/forward calls-to-action in the voiceover.
+  Use vosotros/os forms. Pronounce-aware: write out /θ/ words naturally.
+
+- ig_caption: Instagram caption in ES-ES peninsular Spanish, max 180 words before hashtags.
   Format: keyword-rich opening line (15-25 words) + blank line + 2-3 sentences of
-  connected prose (no bullet fragments) + blank line + CTA line + blank line +
+  connected prose (no bullet fragments) + blank line + soft save/share CTA line + blank line +
   5 hashtags on last line: #MMAEspaña #UFC #peleadoresespañoles #MMAEspanol #PuroMMA
-- narration: ~30-40 word ES-ES summary of the article for potential TTS use.
 """
     return gemini_json(prompt)
 
@@ -182,7 +280,7 @@ def build_drawtext_filters(words_schedule, font_path):
         t0    = w['t_start']
         t1    = w['t_end']
 
-        # Main word: full opacity
+        # Main word
         f = (
             f"drawtext=fontfile='{font_esc}':"
             f"text='{word}':"
@@ -193,7 +291,7 @@ def build_drawtext_filters(words_schedule, font_path):
         )
         filters.append(f)
 
-        # Ghost of previous word (fades out, slightly smaller, at same position)
+        # Ghost of previous word (brief fade-out echo)
         if i > 0 and words_schedule[i-1]['beat'] == w['beat']:
             prev = words_schedule[i-1]
             prev_word = sanitise_drawtext(prev['word'])
@@ -211,74 +309,87 @@ def build_drawtext_filters(words_schedule, font_path):
     return filters
 
 
-def schedule_words(hook_text, body_text, cta_text):
+def schedule_words_from_voice(hook_text, body_beat_1, body_beat_2,
+                               tts_duration, beat_dur):
     """
-    Assign word-by-word timing across 3 beats.
-    Beat 1 (0-3s): hook_text ALL-CAPS, hook style
-    Beat 2+3 (3-9s): body_text words distributed, standard style
-    Last beat final 2s: cta_text, red accent color
+    Distribute on-screen words across the voiceover duration.
+    - Beat 1 (0 → beat_dur): hook_text
+    - Beat 2 (beat_dur → beat_dur*2): body_beat_1
+    - Beat 3 (beat_dur*2 → tts_duration): body_beat_2  [NO CTA card]
+
+    Timing within each beat is proportional to word character length,
+    matching the natural pace of spoken narration.
+
     Returns list of word timing dicts.
     """
-    schedule = []
-    WORD_HOLD = 0.35   # seconds per word
+    total_dur = tts_duration
+    schedule  = []
 
-    # Beat 1: hook words at top of frame, large, white
-    hook_words = hook_text.upper().split()
-    t = 0.15  # small lead-in before first word
-    for word in hook_words:
-        t_end = min(t + WORD_HOLD, 2.9)
-        schedule.append({
-            'word': word, 'beat': 0,
-            't_start': round(t, 3), 't_end': round(t_end, 3),
-            'size': 96, 'color': 'white', 'y_pos': 320
-        })
-        t = t_end
-        if t >= 2.9:
-            break
+    def _distribute(words, t_start, t_end, beat, size, color, y_pos):
+        """Spread word display times proportionally across [t_start, t_end]."""
+        if not words:
+            return
+        # weight by character length (longer words get slightly more screen time)
+        lengths = [max(len(w), 1) for w in words]
+        total_len = sum(lengths)
+        available = t_end - t_start - 0.1   # small lead-in
+        t = t_start + 0.12  # small lead-in before first word
+        for word, char_len in zip(words, lengths):
+            hold = available * (char_len / total_len)
+            hold = max(hold, 0.22)   # minimum 220ms so short words are readable
+            t_end_w = min(t + hold, t_end - 0.05)
+            schedule.append({
+                'word': word, 'beat': beat,
+                't_start': round(t, 3), 't_end': round(t_end_w, 3),
+                'size': size, 'color': color, 'y_pos': y_pos
+            })
+            t = t_end_w
+            if t >= t_end - 0.05:
+                break
 
-    # Beat 2 (3.0-6.0): body words, mid-frame
-    body_words = body_text.upper().split() if body_text else []
-    t = BEAT_DUR + 0.15
-    for word in body_words:
-        t_end = min(t + WORD_HOLD, BEAT_DUR * 2 - 0.1)
-        schedule.append({
-            'word': word, 'beat': 1,
-            't_start': round(t, 3), 't_end': round(t_end, 3),
-            'size': 80, 'color': 'white', 'y_pos': 800
-        })
-        t = t_end
-        if t >= BEAT_DUR * 2 - 0.1:
-            break
+    # Beat 1: hook
+    _distribute(
+        hook_text.upper().split(),
+        t_start=0.0, t_end=beat_dur,
+        beat=0, size=96, color='white', y_pos=320
+    )
 
-    # Beat 3 (6.0-9.0): CTA in red, sentence case, lower centre
-    cta_words = cta_text.split() if cta_text else []
-    t = BEAT_DUR * 2 + 0.2
-    for word in cta_words:
-        t_end = min(t + WORD_HOLD, TOTAL_DUR - 0.15)
-        schedule.append({
-            'word': word, 'beat': 2,
-            't_start': round(t, 3), 't_end': round(t_end, 3),
-            'size': 68, 'color': '#FF4444', 'y_pos': 950
-        })
-        t = t_end
-        if t >= TOTAL_DUR - 0.15:
-            break
+    # Beat 2: body_beat_1
+    _distribute(
+        body_beat_1.upper().split() if body_beat_1 else [],
+        t_start=beat_dur, t_end=beat_dur * 2,
+        beat=1, size=80, color='white', y_pos=800
+    )
+
+    # Beat 3: body_beat_2  (NO CTA — removed per feedback)
+    _distribute(
+        body_beat_2.upper().split() if body_beat_2 else [],
+        t_start=beat_dur * 2, t_end=total_dur,
+        beat=2, size=80, color='white', y_pos=800
+    )
 
     return schedule
 
 
-def render_video(img_path, content, tmp_dir):
+def render_video(img_path, narr_path, narr_duration, content, tmp_dir):
     """
-    Build 3-beat hard-cut reel with kinetic captions.
+    Build 3-beat hard-cut reel with kinetic captions + ES-ES voiceover.
+    Video duration = max(3 beats × BEAT_DUR, narr_duration + 0.5s tail).
     Returns path to rendered MP4.
     """
-    hook_text = content.get('hook_text', content.get('headline', 'PURO MMA'))
-    body_text = content.get('body_text', content.get('headline', ''))
-    cta_text  = content.get('cta_text', 'Mándale esto a un amigo aficionado al MMA.')
-    fighter   = content.get('fighter_name', '')
+    hook_text    = content.get('hook_text', content.get('headline', 'PURO MMA'))
+    body_beat_1  = content.get('body_beat_1', content.get('body_text', ''))
+    body_beat_2  = content.get('body_beat_2', '')
+    fighter      = content.get('fighter_name', '')
+
+    # Video length: long enough to fit voiceover + short tail
+    total_dur = max(BEAT_DUR * 3, narr_duration + 0.4)
+    # Snap to 3-beat grid (avoid partial beats at end)
+    beat_3_end = total_dur
+    print(f'  Video duration: {total_dur:.2f}s (TTS: {narr_duration:.2f}s)')
 
     out_path = os.path.join(tmp_dir, 'reel.mp4')
-    n_frames = int(BEAT_DUR * FPS)  # frames per beat
+    n_frames = int(BEAT_DUR * FPS)  # frames per beat (fixed 3s each)
 
     # Build 3-beat filter_complex
     beat_segments = []
@@ -293,12 +404,14 @@ def render_video(img_path, content, tmp_dir):
         )
         beat_segments.append(seg)
 
-    # Concat beats
     fc_parts = beat_segments
-    fc_parts.append(f"[b0][b1][b2] concat=n=3:v=1:a=0 [pre_text]")
+    fc_parts.append("[b0][b1][b2] concat=n=3:v=1:a=0 [pre_text]")
 
-    # Build word-by-word caption filters
-    words_schedule = schedule_words(hook_text, body_text, cta_text)
+    # Build voice-synced word-by-word caption filters
+    words_schedule = schedule_words_from_voice(
+        hook_text, body_beat_1, body_beat_2,
+        tts_duration=total_dur, beat_dur=BEAT_DUR
+    )
     caption_filters = build_drawtext_filters(words_schedule, FONT_PATH)
 
     # Fighter name watermark (bottom-centre, subtle)
@@ -313,35 +426,32 @@ def render_video(img_path, content, tmp_dir):
             f"shadowcolor=black@0.5:shadowx=2:shadowy=2"
         )
 
-    # Red accent rule — horizontal line below hook beat
+    # Red accent rule — horizontal line below hook beat only
     caption_filters.append(
         f"drawbox=x=60:y=430:w=960:h=4:color=#FF4444@0.85:t=fill:"
         f"enable='lte(t,{BEAT_DUR:.1f})'"
     )
 
-    # Dark overlay bars for readability (hook beat + CTA beat)
+    # Dark overlay bars for readability
     readability = [
         # Hook beat background bar
         f"drawbox=x=0:y=270:w=1080:h=200:color=black@0.55:t=fill:"
         f"enable='lte(t,{BEAT_DUR:.1f})'",
-        # Body beat background bar
+        # Body beats background bar (beats 2 + 3)
         f"drawbox=x=0:y=755:w=1080:h=140:color=black@0.50:t=fill:"
-        f"enable='between(t,{BEAT_DUR:.1f},{BEAT_DUR*2:.1f})'",
-        # CTA beat background bar
-        f"drawbox=x=0:y=905:w=1080:h=130:color=black@0.55:t=fill:"
-        f"enable='gte(t,{BEAT_DUR*2:.1f})'",
+        f"enable='gte(t,{BEAT_DUR:.1f})'",
     ]
 
     all_text_filters = ','.join(readability + caption_filters)
     fc_parts.append(f"[pre_text] {all_text_filters} [v_text]")
 
-    # Logo overlay (bottom-right corner, constant)
+    # Logo overlay
     has_logo = os.path.exists(LOGO_PATH)
-    logo_w = int(1080 * 0.13)   # ~140px (13% of frame width)
+    logo_w   = int(1080 * 0.13)
     if has_logo:
         fc_parts.append(f"[2:v] scale={logo_w}:-1 [logo]")
         logo_x = 1080 - logo_w - 20
-        logo_y = 1920 - logo_w - 20  # square logo ~same dimensions
+        logo_y = 1920 - logo_w - 20
         fc_parts.append(
             f"[v_text][logo] overlay={logo_x}:{logo_y}:format=auto,"
             f"format=yuv420p,"
@@ -353,25 +463,37 @@ def render_video(img_path, content, tmp_dir):
             f"setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709 [v]"
         )
 
-    # Audio: music bed trimmed to total duration, volume 0.08
-    music_dur_check = audio_duration(MUSIC_PATH)
-    fade_out_st = TOTAL_DUR - 1.5
+    # Audio: music bed (vol 0.07) + voiceover (vol 1.0), amix
+    fade_out_st = total_dur - 1.5
+    music_fade_out = max(fade_out_st, 0.0)
+    narr_fade_out  = max(narr_duration - 0.4, 0.0)
+    narr_input_idx = 3 if has_logo else 2
+
     fc_parts.append(
-        f"[1:a] atrim=0:{TOTAL_DUR},asetpts=PTS-STARTPTS,"
-        f"volume=0.08,"
+        f"[1:a] atrim=0:{total_dur},asetpts=PTS-STARTPTS,"
+        f"volume=0.07,"
         f"afade=t=in:st=0:d=0.8,"
-        f"afade=t=out:st={fade_out_st:.2f}:d=1.4 [audio]"
+        f"afade=t=out:st={music_fade_out:.2f}:d=1.4 [music]"
+    )
+    fc_parts.append(
+        f"[{narr_input_idx}:a] volume=1.0,"
+        f"afade=t=in:st=0:d=0.15,"
+        f"afade=t=out:st={narr_fade_out:.2f}:d=0.4 [narr]"
+    )
+    fc_parts.append(
+        "[music][narr] amix=inputs=2:duration=first:normalize=0 [audio]"
     )
 
     filter_complex = '; '.join(fc_parts)
 
-    # Build inputs
+    # Build inputs: image, music, (logo), narration
     inputs = [
-        '-loop', '1', '-framerate', str(FPS), '-t', str(TOTAL_DUR + 0.5), '-i', img_path,
+        '-loop', '1', '-framerate', str(FPS), '-t', str(total_dur + 0.5), '-i', img_path,
         '-i', MUSIC_PATH,
     ]
     if has_logo:
         inputs += ['-i', LOGO_PATH]
+    inputs += ['-i', narr_path]
 
     cmd = (
         ['ffmpeg', '-y'] + inputs +
@@ -382,27 +504,25 @@ def render_video(img_path, content, tmp_dir):
             '-movflags', '+faststart',
             '-pix_fmt', 'yuv420p',
             '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
-            '-t', str(TOTAL_DUR), '-r', str(FPS),
+            '-t', str(total_dur), '-r', str(FPS),
             out_path
         ]
     )
 
-    print(f'  FFmpeg render ({TOTAL_DUR}s, 3 beats)...')
+    print(f'  FFmpeg render ({total_dur:.2f}s, 3 beats + voice)...')
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         stderr_tail = (result.stderr or '')[-4000:]
         print(f'  FFmpeg stderr:\n{stderr_tail}')
         raise RuntimeError(f'FFmpeg failed (rc={result.returncode})')
     print(f'  Render complete: {out_path}')
-    return out_path
+    return out_path, total_dur
 
 
 # ── R2 upload ─────────────────────────────────────────────────────────────────
 
 def upload_to_r2(local_path, object_key, content_type):
     """Upload file to R2 via aws-cli (pre-installed on ubuntu-latest)."""
-    # aws-cli reads AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from environment
-    # (set in the GH Actions workflow as R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY)
     cmd = [
         'aws', 's3', 'cp', local_path,
         f's3://{R2_BUCKET}/{object_key}',
@@ -427,7 +547,6 @@ def upload_to_r2(local_path, object_key, content_type):
 # ── Callback ──────────────────────────────────────────────────────────────────
 
 def post_callback(callback_url, payload, token=None):
-    """POST result to n8n callback URL. Silently skips if no callback_url."""
     if not callback_url:
         print('  No callback_url — skipping callback.')
         return
@@ -457,17 +576,27 @@ def main():
     callback_url = job.get('callback_url', '')
     n8n_token    = os.environ.get('N8N_CALLBACK_TOKEN', '')
 
-    print(f'=== PuroMMA Render Pipeline ===')
+    print(f'=== PuroMMA Render Pipeline (Stage 1b) ===')
     print(f'  job_id: {job_id}')
     print(f'  post_title: {post_title[:80]}')
     print(f'  content_type: {content_type}')
+    print(f'  wp_post_id: {wp_post_id}')
     print(f'  font: {FONT_PATH}')
 
     if not image_url:
         raise ValueError('image_url is required in JOB_PAYLOAD')
 
+    # TTS voice rotation: deterministic by wp_post_id % 3
+    try:
+        voice_idx = int(wp_post_id) % len(PUROMMA_TTS_VOICES)
+    except (ValueError, TypeError):
+        voice_idx = 0
+    chosen_voice = PUROMMA_TTS_VOICES[voice_idx]
+    print(f'  TTS voice: {chosen_voice["name"]} ({chosen_voice["gender"]}) '
+          f'[wp_post_id={wp_post_id}, idx={voice_idx}]')
+
     ts = int(time.time())
-    filename      = f'puromma_{wp_post_id}_{ts}.mp4'
+    filename       = f'puromma_{wp_post_id}_{ts}.mp4'
     cover_filename = f'puromma_{wp_post_id}_{ts}_cover.jpg'
 
     tmp_dir = tempfile.mkdtemp(prefix='reel_')
@@ -476,73 +605,81 @@ def main():
         # 1. Content generation
         print('  Generating content (Gemini)...')
         content = generate_content(post_title, image_url, content_type)
-        print(f"  fighter: {content.get('fighter_name')} | hook: {content.get('hook_text', '')[:60]}")
+        print(f"  fighter: {content.get('fighter_name')}")
+        print(f"  hook: {content.get('hook_text', '')[:60]}")
+        print(f"  body_beat_1: {content.get('body_beat_1', '')[:70]}")
+        print(f"  body_beat_2: {content.get('body_beat_2', '')[:70]}")
+        print(f"  voiceover: {content.get('voiceover', '')[:100]}")
 
-        # Allow payload overrides (Pablo or n8n can pass pre-written copy)
+        # Allow payload overrides
         if job.get('hook_text'):
             content['hook_text'] = job['hook_text']
-        if job.get('cta_text'):
-            content['cta_text'] = job['cta_text']
 
-        # 2. Download fighter image
+        # 2. TTS — ES-ES voiceover
+        narr_path = os.path.join(tmp_dir, 'narration.wav')
+        voiceover_text = content.get('voiceover', post_title)
+        print(f'  TTS ({chosen_voice["name"]}, ES-ES)...')
+        pcm, rate = gemini_tts(voiceover_text, chosen_voice['name'], chosen_voice['style'])
+        with open(narr_path, 'wb') as f:
+            f.write(pcm_to_wav(pcm, rate))
+        narr_dur = audio_duration(narr_path)
+        print(f'  Narration duration: {narr_dur:.2f}s')
+
+        # 3. Download fighter image
         img_path = os.path.join(tmp_dir, 'fighter.jpg')
         print(f'  Downloading image: {image_url[:80]}...')
         download_image(image_url, img_path)
 
-        # 3. Render video
-        mp4_path = render_video(img_path, content, tmp_dir)
+        # 4. Render video (voice-synced captions, no CTA card)
+        mp4_path, video_dur = render_video(img_path, narr_path, narr_dur, content, tmp_dir)
 
-        # 4. Cover image
+        # 5. Cover image
         print('  Generating cover...')
         cover_path = make_cover(image_url, tmp_dir)
 
-        # 5. Upload to R2
+        # 6. Upload to R2
         video_url = upload_to_r2(mp4_path, filename, 'video/mp4')
         cover_url = upload_to_r2(cover_path, cover_filename, 'image/jpeg')
 
-        # 6. Output to Actions summary / step output
+        # 7. Summary
         ig_caption = content.get('ig_caption', post_title)
-        duration   = TOTAL_DUR
 
         summary_lines = [
-            '## PuroMMA Render Complete',
+            '## PuroMMA Render Complete (Stage 1b)',
             f'- **Job ID:** {job_id}',
             f'- **Fighter:** {content.get("fighter_name", "?")}',
             f'- **Hook:** {content.get("hook_text", "?")}',
-            f'- **Duration:** {duration}s',
+            f'- **TTS Voice:** {chosen_voice["name"]} ({chosen_voice["gender"]})',
+            f'- **Duration:** {video_dur:.2f}s (TTS: {narr_dur:.2f}s)',
             f'- **Video URL:** {video_url}',
             f'- **Cover URL:** {cover_url}',
             f'- **IG Caption (first 200 chars):** {ig_caption[:200]}',
         ]
         print('\n'.join(summary_lines))
 
-        # Write to GITHUB_STEP_SUMMARY if available
         summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
         if summary_file:
             with open(summary_file, 'a') as f:
                 f.write('\n'.join(summary_lines) + '\n')
 
-        # Write step outputs if GITHUB_OUTPUT available
-        # ig_caption may contain newlines — use multiline heredoc syntax
         output_file = os.environ.get('GITHUB_OUTPUT')
         if output_file:
             with open(output_file, 'a', encoding='utf-8') as f:
                 f.write(f'video_url={video_url}\n')
                 f.write(f'cover_url={cover_url}\n')
-                # Multiline value syntax for GITHUB_OUTPUT
                 caption_safe = ig_caption[:500].replace('\r', '')
                 delim = 'EOF_CAPTION'
                 f.write(f'ig_caption<<{delim}\n{caption_safe}\n{delim}\n')
 
-        # 7. Callback to n8n (if provided)
         result_payload = {
             'job_id':     job_id,
             'status':     'success',
             'video_url':  video_url,
             'cover_url':  cover_url,
             'ig_caption': ig_caption,
-            'duration':   duration,
+            'duration':   video_dur,
             'filename':   filename,
+            'tts_voice':  chosen_voice['name'],
         }
         post_callback(callback_url, result_payload, n8n_token)
 
