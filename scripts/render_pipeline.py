@@ -147,11 +147,31 @@ def audio_duration(path):
     raise RuntimeError(f'No audio stream in {path}')
 
 
-def download_image(url, dest_path):
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=30) as r:
+def download_image(url, dest_path, image_b64=None):
+    """Download image from URL, or decode from base64 if image_b64 provided.
+
+    image_b64 is used as fallback when the origin blocks GH Actions runner IPs.
+    """
+    if image_b64:
         with open(dest_path, 'wb') as f:
-            f.write(r.read())
+            f.write(base64.b64decode(image_b64))
+        return
+    # Try a browser-like UA first; some WP/Cloudflare setups block curl/urllib defaults
+    for ua in (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        'Mozilla/5.0 (compatible; PuroMMA-bot/1.0)',
+    ):
+        req = urllib.request.Request(url, headers={'User-Agent': ua})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                with open(dest_path, 'wb') as f:
+                    f.write(r.read())
+            return
+        except urllib.error.HTTPError as e:
+            if e.code == 403:
+                continue
+            raise
+    raise RuntimeError(f'Image download failed with 403 for all user-agents: {url}')
 
 
 def ffprobe_image_dims(path):
@@ -225,11 +245,11 @@ Return ONLY valid JSON with exactly these keys:
 
 # ── Cover image ───────────────────────────────────────────────────────────────
 
-def make_cover(image_url, tmp_dir):
+def make_cover(image_url, tmp_dir, image_b64=None):
     """Download + FFmpeg to 1080x1920 brightened JPEG. Returns path."""
     src = os.path.join(tmp_dir, 'cover_src.jpg')
     out = os.path.join(tmp_dir, 'cover.jpg')
-    download_image(image_url, src)
+    download_image(image_url, src, image_b64=image_b64)
     subprocess.run([
         'ffmpeg', '-y', '-i', src,
         '-vf', (
@@ -571,6 +591,7 @@ def main():
     job_id       = job.get('job_id', f"puromma_{int(time.time())}")
     post_title   = job.get('post_title', 'PuroMMA Article')
     image_url    = job.get('image_url', '')
+    image_b64    = job.get('image_b64', None)   # optional: base64-encoded image bytes
     wp_post_id   = job.get('wp_post_id', '0')
     content_type = job.get('content_type', 'news_hook')
     callback_url = job.get('callback_url', '')
@@ -625,17 +646,20 @@ def main():
         narr_dur = audio_duration(narr_path)
         print(f'  Narration duration: {narr_dur:.2f}s')
 
-        # 3. Download fighter image
+        # 3. Download fighter image (or decode from base64 if origin blocks runner IPs)
         img_path = os.path.join(tmp_dir, 'fighter.jpg')
-        print(f'  Downloading image: {image_url[:80]}...')
-        download_image(image_url, img_path)
+        if image_b64:
+            print(f'  Decoding image from base64 payload ({len(image_b64)} chars)...')
+        else:
+            print(f'  Downloading image: {image_url[:80]}...')
+        download_image(image_url, img_path, image_b64=image_b64)
 
         # 4. Render video (voice-synced captions, no CTA card)
         mp4_path, video_dur = render_video(img_path, narr_path, narr_dur, content, tmp_dir)
 
         # 5. Cover image
         print('  Generating cover...')
-        cover_path = make_cover(image_url, tmp_dir)
+        cover_path = make_cover(image_url, tmp_dir, image_b64=image_b64)
 
         # 6. Upload to R2
         video_url = upload_to_r2(mp4_path, filename, 'video/mp4')
