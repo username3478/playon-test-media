@@ -1,0 +1,37 @@
+name: Render Reel
+
+on:
+  repository_dispatch:
+    types: [render-reel]
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: sudo apt-get install -y ffmpeg
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: pip install requests
+
+      - name: Run render pipeline
+        env:
+          GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
+          R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
+          R2_ENDPOINT:          ${{ secrets.R2_ENDPOINT }}
+          R2_PUBLIC_URL:        ${{ secrets.R2_PUBLIC_URL }}
+          N8N_CALLBACK_TOKEN:   ${{ secrets.N8N_CALLBACK_TOKEN }}
+          JOB_PAYLOAD:          ${{ toJson(github.event.client_payload) }}
+        run: python scripts/render_pipeline.py
