@@ -1,8 +1,14 @@
 """
-PuroMMA Reels Render Pipeline — GitHub Actions edition  (Stage 1b)
+PuroMMA Reels Render Pipeline — GitHub Actions edition  (Stage 1c)
 Reads JOB_PAYLOAD from environment, renders 3-beat MP4 with kinetic captions,
 ES-ES voiceover (Gemini TTS), uploads to Cloudflare R2, optionally POSTs result
 to callback_url.
+
+Stage 1c changes vs Stage 1b:
+- Voiceover constrained to ~30-35 words (~10-13s spoken) → target 12-15s total reel
+- Persistent pulsating send-CTA fixed at bottom of reel for entire duration
+  (text: "Envíaselo a un colega", alpha pulse 0.6↔1.0 on 1.2s sine cycle,
+   pill background, clear of IG UI zones, centered at y≈1500)
 
 Stage 1b changes vs Stage 1:
 - ES-ES voiceover via Gemini TTS (Zephyr/Umbriel/Gacrux rotation by wp_post_id % 3)
@@ -228,10 +234,11 @@ Return ONLY valid JSON with exactly these keys:
   Same rules as body_beat_1 — standalone, grammatically complete, no mid-sentence cut.
   Example: "EL VETERANO AMERICANO DA SU PREDICCIÓN MÁS DEMOLEDORA HASTA LA FECHA"
 
-- voiceover: ~35-45 word natural flowing narration in ES-ES peninsular Spanish.
-  This is spoken aloud — write it as connected, natural speech.
-  Structure: intriguing hook sentence → key fact → teaser for more.
-  End with a natural closing line (e.g. "Esto lo cambia todo." or "La pregunta es cuándo.").
+- voiceover: CONCISE narration in ES-ES peninsular Spanish. HARD LIMIT: 30-35 words MAX
+  (count carefully — this is spoken aloud and must fit ~10-13 seconds).
+  Structure: sharp hook (1 sentence) → key fact (1 sentence) → punchy closer (1 sentence).
+  Each sentence must be tight — no filler, no padding.
+  End with a punchy 3-5 word closing line (e.g. "Esto lo cambia todo." or "La pregunta es cuándo.").
   NO send/share/forward calls-to-action in the voiceover.
   Use vosotros/os forms. Pronounce-aware: write out /θ/ words naturally.
 
@@ -452,6 +459,43 @@ def render_video(img_path, narr_path, narr_duration, content, tmp_dir):
         f"enable='lte(t,{BEAT_DUR:.1f})'"
     )
 
+    # Persistent pulsating send-CTA — full duration, bottom of reel
+    # Safe zone analysis (1080x1920 canvas):
+    #   - IG bottom UI (caption / progress / controls): y > ~1640 — off limits
+    #   - Body captions sit around y=800 — >650px above this CTA — no collision
+    # Pill: semi-transparent black bar, centred horizontally, y≈1480-1550
+    # Text pulses alpha 0.6↔1.0 on a 1.2s sine cycle (smooth, never hard-blink)
+    # Red accent: thin drawbox underline below the text (always-on, same alpha pulse not
+    # possible for drawbox, so it stays at constant alpha 0.75 — subtle enough)
+    cta_text    = "ENVIASELO A UN COLEGA"   # ALL CAPS, Anton, no accent needed for display
+    cta_pill_x  = 270
+    cta_pill_y  = 1476   # top of pill
+    cta_pill_w  = 540
+    cta_pill_h  = 60     # pill height → centre ≈ y1506
+    cta_text_y  = 1482   # drawtext y (baseline ≈ centre of pill)
+    cta_accent_y = cta_pill_y + cta_pill_h + 2   # thin red line just below pill
+    cta_pulse   = "0.6+0.4*abs(sin(2*PI*t/1.2))"
+    # Pill background (constant — provides legibility even when text is at min alpha)
+    caption_filters.append(
+        f"drawbox=x={cta_pill_x}:y={cta_pill_y}:w={cta_pill_w}:h={cta_pill_h}:"
+        f"color=black@0.55:t=fill"
+    )
+    # Pulsating CTA text (white, Anton, centred in pill)
+    cta_safe = sanitise_drawtext(cta_text)
+    caption_filters.append(
+        f"drawtext=fontfile='{font_esc}':"
+        f"text='{cta_safe}':"
+        f"fontsize=28:fontcolor=white:"
+        f"alpha='{cta_pulse}':"
+        f"x='(w-tw)/2':y={cta_text_y}:"
+        f"shadowcolor=black@0.7:shadowx=2:shadowy=2"
+    )
+    # Red accent underline below pill (PuroMMA brand colour, constant)
+    caption_filters.append(
+        f"drawbox=x={cta_pill_x}:y={cta_accent_y}:w={cta_pill_w}:h=3:"
+        f"color=#FF4444@0.75:t=fill"
+    )
+
     # Dark overlay bars for readability
     readability = [
         # Hook beat background bar
@@ -597,7 +641,7 @@ def main():
     callback_url = job.get('callback_url', '')
     n8n_token    = os.environ.get('N8N_CALLBACK_TOKEN', '')
 
-    print(f'=== PuroMMA Render Pipeline (Stage 1b) ===')
+    print(f'=== PuroMMA Render Pipeline (Stage 1c) ===')
     print(f'  job_id: {job_id}')
     print(f'  post_title: {post_title[:80]}')
     print(f'  content_type: {content_type}')
@@ -669,7 +713,7 @@ def main():
         ig_caption = content.get('ig_caption', post_title)
 
         summary_lines = [
-            '## PuroMMA Render Complete (Stage 1b)',
+            '## PuroMMA Render Complete (Stage 1c)',
             f'- **Job ID:** {job_id}',
             f'- **Fighter:** {content.get("fighter_name", "?")}',
             f'- **Hook:** {content.get("hook_text", "?")}',
