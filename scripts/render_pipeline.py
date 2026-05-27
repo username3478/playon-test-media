@@ -17,7 +17,7 @@ R2_PUBLIC_URL   = os.environ['R2_PUBLIC_URL']      # https://pub-xxx.r2.dev
 # R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY are used by aws-cli via env vars
 # (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY — set in GH Actions env block)
 
-GEMINI_FLASH    = 'gemini-2.0-flash'
+GEMINI_FLASH    = 'gemini-3-flash-preview'
 GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models'
 
 # Font path (bundled in repo — Anton Regular, OFL license)
