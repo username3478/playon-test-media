@@ -523,12 +523,16 @@ def main():
                 f.write('\n'.join(summary_lines) + '\n')
 
         # Write step outputs if GITHUB_OUTPUT available
+        # ig_caption may contain newlines — use multiline heredoc syntax
         output_file = os.environ.get('GITHUB_OUTPUT')
         if output_file:
-            with open(output_file, 'a') as f:
+            with open(output_file, 'a', encoding='utf-8') as f:
                 f.write(f'video_url={video_url}\n')
                 f.write(f'cover_url={cover_url}\n')
-                f.write(f'ig_caption={ig_caption[:500]}\n')
+                # Multiline value syntax for GITHUB_OUTPUT
+                caption_safe = ig_caption[:500].replace('\r', '')
+                delim = 'EOF_CAPTION'
+                f.write(f'ig_caption<<{delim}\n{caption_safe}\n{delim}\n')
 
         # 7. Callback to n8n (if provided)
         result_payload = {
