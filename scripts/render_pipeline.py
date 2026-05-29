@@ -1,5 +1,5 @@
 """
-PuroMMA Reels Render Pipeline — GitHub Actions edition  (Stage 1c)
+PuroMMA Reels Render Pipeline — GitHub Actions edition  (Stage 1d)
 Reads JOB_PAYLOAD from environment, renders 3-beat MP4 with kinetic captions,
 ES-ES voiceover (Gemini TTS), uploads to Cloudflare R2, optionally POSTs result
 to callback_url.
@@ -435,9 +435,11 @@ def render_video(img_path, narr_path, narr_duration, content, tmp_dir):
     fc_parts.append("[b0][b1][b2] concat=n=3:v=1:a=0 [pre_text]")
 
     # Build voice-synced word-by-word caption filters
+    # Stage 1d fix: pass narr_duration (actual TTS length) not total_dur.
+    # total_dur includes 0.4s tail padding which caused captions to drift behind voice.
     words_schedule = schedule_words_from_voice(
         hook_text, body_beat_1, body_beat_2,
-        tts_duration=total_dur, beat_dur=BEAT_DUR
+        tts_duration=narr_duration, beat_dur=BEAT_DUR
     )
     caption_filters = build_drawtext_filters(words_schedule, FONT_PATH)
 
@@ -534,8 +536,9 @@ def render_video(img_path, narr_path, narr_duration, content, tmp_dir):
     narr_input_idx = 3 if has_logo else 2
 
     fc_parts.append(
+        # Stage 1d fix: raised 0.07->0.18; 0.07 was inaudible on device speakers.
         f"[1:a] atrim=0:{total_dur},asetpts=PTS-STARTPTS,"
-        f"volume=0.07,"
+        f"volume=0.18,"
         f"afade=t=in:st=0:d=0.8,"
         f"afade=t=out:st={music_fade_out:.2f}:d=1.4 [music]"
     )
@@ -641,7 +644,7 @@ def main():
     callback_url = job.get('callback_url', '')
     n8n_token    = os.environ.get('N8N_CALLBACK_TOKEN', '')
 
-    print(f'=== PuroMMA Render Pipeline (Stage 1c) ===')
+    print(f'=== PuroMMA Render Pipeline (Stage 1d) ===')
     print(f'  job_id: {job_id}')
     print(f'  post_title: {post_title[:80]}')
     print(f'  content_type: {content_type}')
@@ -713,7 +716,7 @@ def main():
         ig_caption = content.get('ig_caption', post_title)
 
         summary_lines = [
-            '## PuroMMA Render Complete (Stage 1c)',
+            '## PuroMMA Render Complete (Stage 1d)',
             f'- **Job ID:** {job_id}',
             f'- **Fighter:** {content.get("fighter_name", "?")}',
             f'- **Hook:** {content.get("hook_text", "?")}',
