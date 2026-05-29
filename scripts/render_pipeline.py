@@ -12,7 +12,10 @@ Stage 1d.2 fixes vs 1d.1 (and Stage 1c):
   spoken voiceover. Now what's on screen matches what's spoken.
 - Readability bar timing (top hook bar vs bottom body bar) follows the same
   proportional beat boundaries, so the bar under the caption is always present.
-- Music bed kept at vol 0.18 (~-15 dB) from 1d.1; voice ~0 dB → balance in target.
+- Music bed boosted to volume=2.0 (the in-repo bed.wav is integrated -44 LUFS /
+  peak -24.5 dBTP, much quieter than the bed render_server.py was tuned against).
+  At vol=2.0 music lands at peak ~-18 dB / mean ~-32 dB — voice ~13 dB above bed,
+  in Pablo's "voice 12-16 dB above music" target.
 
 Stage 1c changes vs Stage 1b:
 - Voiceover constrained to ~30-35 words (~10-13s spoken) → target 12-15s total reel
@@ -698,9 +701,15 @@ def render_video(img_path, narr_path, narr_duration, content, tmp_dir):
     narr_input_idx = 3 if has_logo else 2
 
     fc_parts.append(
-        # Stage 1d fix: raised 0.07->0.18; 0.07 was inaudible on device speakers.
+        # Stage 1d.2 fix: bed.wav source is integrated -44.1 LUFS / true peak -24.5 dBTP
+        # (verified with ffmpeg loudnorm + volumedetect on assets/audio/bed.wav). The
+        # earlier 0.07 (render_server.py) and 0.18 (1d.1) values were calibrated for a
+        # bed mastered closer to -20 LUFS; against THIS quieter source they pushed the
+        # music to -53 dB / -39 dB integrated — inaudible vs voice peaks of ~-5 dB.
+        # volume=2.0 (+6 dB) lifts music to ~-32 dB mean / ~-18 dB peak, ~13 dB under
+        # voice peaks → in Pablo's "voice 12-16 dB above bed" target.
         f"[1:a] atrim=0:{total_dur},asetpts=PTS-STARTPTS,"
-        f"volume=0.18,"
+        f"volume=2.0,"
         f"afade=t=in:st=0:d=0.8,"
         f"afade=t=out:st={music_fade_out:.2f}:d=1.4 [music]"
     )
