@@ -1,8 +1,18 @@
 """
-PuroMMA Reels Render Pipeline — GitHub Actions edition  (Stage 1d.2)
+PuroMMA Reels Render Pipeline — GitHub Actions edition  (Stage 1d.3)
 Reads JOB_PAYLOAD from environment, renders 3-beat MP4 with kinetic captions,
 ES-ES voiceover (Gemini TTS), uploads to Cloudflare R2, optionally POSTs result
 to callback_url.
+
+Stage 1d.3 polish vs 1d.2 (Pablo's verdict on reel DY635FYDwNH):
+- Bed bumped from volume=2.0 → 3.0 (+50% linear, ~+3.5 dB). Music now ~-15 dB peak
+  vs voice peaks at ~-5 dB → ~10 dB separation (slightly under 12-16 dB target but
+  Pablo prioritised audibility).
+- Event numbers (UFC 329, PFL 7, Bellator 305, etc.) rewritten digit-by-digit for
+  TTS only — captions still show "UFC 329" visually but voice now reads
+  "UFC tres dos nueve" instead of the cardinal "UFC trescientos veintinueve".
+- CTA accent restored: "ENVIASELO" → "ENVÍASELO".
+- bed.wav licence still deferred per Pablo (2026-05-29).
 
 Stage 1d.2 fixes vs 1d.1 (and Stage 1c):
 - Captions are now keyed off the ACTUAL voiceover text (split by sentence boundary
@@ -208,6 +218,43 @@ def sanitise_drawtext(s):
     s = s.replace(':', '\\:')
     s = s.replace('%', '\\%')
     return s
+
+
+# ── TTS pronunciation shaping ─────────────────────────────────────────────────
+
+_ES_DIGIT_WORDS = {
+    '0': 'cero', '1': 'uno', '2': 'dos', '3': 'tres', '4': 'cuatro',
+    '5': 'cinco', '6': 'seis', '7': 'siete', '8': 'ocho', '9': 'nueve',
+}
+
+# Match common MMA event labels followed by an event number (e.g. "UFC 329",
+# "ufc fight night 251", "PFL 7", "Bellator 305", "ONE 165").
+_EVENT_NUMBER_RE = re.compile(
+    r'\b(UFC(?:\s+Fight\s+Night)?|UFC\s+FN|UFC\s+on\s+ESPN|UFC\s+APEX|'
+    r'PFL|Bellator|ONE|RIZIN|KSW|Cage\s+Warriors)'
+    r'(\s+)(\d{2,4})\b',
+    flags=re.IGNORECASE,
+)
+
+
+def spell_event_numbers_for_tts(text):
+    """Rewrite event numbers as digit-by-digit Spanish for the TTS pass only.
+
+    Pablo's 1d.3 verdict: Gemini TTS reads 'UFC 329' as 'UFC trescientos veintinueve'
+    (cardinal). For sports event numbering Pablo wants digit-by-digit:
+    'UFC tres dos nueve'. This rewrite is applied ONLY to the text fed to TTS — the
+    voiceover field used for on-screen captions keeps the numerals so the caption
+    reads "UFC 329" visually.
+
+    Returns the rewritten string.
+    """
+    if not text:
+        return text
+    def repl(m):
+        label, gap, num = m.group(1), m.group(2), m.group(3)
+        spelled = ' '.join(_ES_DIGIT_WORDS[d] for d in num)
+        return f"{label}{gap}{spelled}"
+    return _EVENT_NUMBER_RE.sub(repl, text)
 
 
 # ── Content generation ────────────────────────────────────────────────────────
@@ -632,7 +679,7 @@ def render_video(img_path, narr_path, narr_duration, content, tmp_dir):
     # Text pulses alpha 0.6↔1.0 on a 1.2s sine cycle (smooth, never hard-blink)
     # Red accent: thin drawbox underline below the text (always-on, same alpha pulse not
     # possible for drawbox, so it stays at constant alpha 0.75 — subtle enough)
-    cta_text    = "ENVIASELO A UN COLEGA"   # ALL CAPS, Anton, no accent needed for display
+    cta_text    = "ENVÍASELO A UN COLEGA"   # 1d.3: restored Í accent per Pablo
     cta_pill_x  = 270
     cta_pill_y  = 1476   # top of pill
     cta_pill_w  = 540
@@ -701,15 +748,14 @@ def render_video(img_path, narr_path, narr_duration, content, tmp_dir):
     narr_input_idx = 3 if has_logo else 2
 
     fc_parts.append(
-        # Stage 1d.2 fix: bed.wav source is integrated -44.1 LUFS / true peak -24.5 dBTP
-        # (verified with ffmpeg loudnorm + volumedetect on assets/audio/bed.wav). The
-        # earlier 0.07 (render_server.py) and 0.18 (1d.1) values were calibrated for a
-        # bed mastered closer to -20 LUFS; against THIS quieter source they pushed the
-        # music to -53 dB / -39 dB integrated — inaudible vs voice peaks of ~-5 dB.
-        # volume=2.0 (+6 dB) lifts music to ~-32 dB mean / ~-18 dB peak, ~13 dB under
-        # voice peaks → in Pablo's "voice 12-16 dB above bed" target.
+        # Stage 1d.3: Pablo's verdict on 1d.2 — bed audible but "barely", asked for
+        # +50% louder. 1d.2 was at volume=2.0 → bumped to volume=3.0 here (+50% linear
+        # gain, ~+3.5 dB on top). Music now lands ~-26 dB mean / ~-15 dB peak; voice
+        # peaks ~-5 dB → ~10 dB voice-over-bed (slightly under the 12-16 dB target,
+        # but Pablo's call to prioritise audibility over hard ducking).
+        # See Stage 1d.2 header for bed.wav source-level analysis (-44 LUFS integrated).
         f"[1:a] atrim=0:{total_dur},asetpts=PTS-STARTPTS,"
-        f"volume=2.0,"
+        f"volume=3.0,"
         f"afade=t=in:st=0:d=0.8,"
         f"afade=t=out:st={music_fade_out:.2f}:d=1.4 [music]"
     )
@@ -815,7 +861,7 @@ def main():
     callback_url = job.get('callback_url', '')
     n8n_token    = os.environ.get('N8N_CALLBACK_TOKEN', '')
 
-    print(f'=== PuroMMA Render Pipeline (Stage 1d.2) ===')
+    print(f'=== PuroMMA Render Pipeline (Stage 1d.3) ===')
     print(f'  job_id: {job_id}')
     print(f'  post_title: {post_title[:80]}')
     print(f'  content_type: {content_type}')
@@ -855,10 +901,16 @@ def main():
             content['hook_text'] = job['hook_text']
 
         # 2. TTS — ES-ES voiceover
+        # 1d.3: rewrite event numbers (UFC 329 etc.) digit-by-digit FOR TTS ONLY —
+        # captions still see the numerals via content['voiceover'] (looks right on screen,
+        # reads right out loud).
         narr_path = os.path.join(tmp_dir, 'narration.wav')
         voiceover_text = content.get('voiceover', post_title)
+        tts_text = spell_event_numbers_for_tts(voiceover_text)
+        if tts_text != voiceover_text:
+            print(f'  TTS text rewrite (event numbers): {tts_text[:120]}')
         print(f'  TTS ({chosen_voice["name"]}, ES-ES)...')
-        pcm, rate = gemini_tts(voiceover_text, chosen_voice['name'], chosen_voice['style'])
+        pcm, rate = gemini_tts(tts_text, chosen_voice['name'], chosen_voice['style'])
         with open(narr_path, 'wb') as f:
             f.write(pcm_to_wav(pcm, rate))
         narr_dur = audio_duration(narr_path)
@@ -887,7 +939,7 @@ def main():
         ig_caption = content.get('ig_caption', post_title)
 
         summary_lines = [
-            '## PuroMMA Render Complete (Stage 1d.2)',
+            '## PuroMMA Render Complete (Stage 1d.3)',
             f'- **Job ID:** {job_id}',
             f'- **Fighter:** {content.get("fighter_name", "?")}',
             f'- **Hook:** {content.get("hook_text", "?")}',
