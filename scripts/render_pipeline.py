@@ -300,6 +300,11 @@ Return ONLY valid JSON with exactly these keys:
   End with a punchy 3-5 word closing line (e.g. "Esto lo cambia todo." or "La pregunta es cuándo.").
   NO send/share/forward calls-to-action in the voiceover.
   Use vosotros/os forms. Pronounce-aware: write out /θ/ words naturally.
+  CRÍTICO: para números de eventos (UFC 329, UFC Fight Night 251, Bellator 305,
+  PFL 7, ONE 165, etc.) escribe SIEMPRE el número como dígitos ("UFC 329"),
+  NUNCA como cardinal escrito ("UFC trescientos veintinueve"). El post-procesamiento
+  de TTS lee los dígitos uno a uno ("UFC tres dos nueve") — esto solo funciona
+  si llegan como dígitos. Misma regla para body_beat_1 y body_beat_2.
 
 - ig_caption: Instagram caption in ES-ES peninsular Spanish, max 180 words before hashtags.
   Format: keyword-rich opening line (15-25 words) + blank line + 2-3 sentences of
