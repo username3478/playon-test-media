@@ -1,8 +1,18 @@
 """
-PuroMMA Reels Render Pipeline — GitHub Actions edition  (Stage 1d.3)
+PuroMMA Reels Render Pipeline — GitHub Actions edition  (Stage 1d.4)
 Reads JOB_PAYLOAD from environment, renders 3-beat MP4 with kinetic captions,
 ES-ES voiceover (Gemini TTS), uploads to Cloudflare R2, optionally POSTs result
 to callback_url.
+
+Stage 1d.4 polish vs 1d.3 (Pablo's verdict on Stage 2 batch):
+- Music sidechain ducking: bed runs LOUD (volume=5.0, ~-10 dB peak) but is ducked
+  ~8 dB whenever voice exceeds -26 dB, releasing over 300 ms. Pablo couldn't hear the
+  bed at any prior level (0.07 → 0.18 → 2.0 → 3.0) because phone-speaker dynamic-range
+  compression squashes static mixes; the ducker means the bed is clearly present in
+  pauses while staying out of the voice's way during speech.
+- Image filter: punchier source via eq (contrast=1.10, saturation=1.18, gamma=0.96,
+  brightness=0.02) applied before zoompan; stronger unsharp after zoompan
+  (luma_msize=5, luma_amount=1.2). Cover image gets the same treatment.
 
 Stage 1d.3 polish vs 1d.2 (Pablo's verdict on reel DY635FYDwNH):
 - Bed bumped from volume=2.0 → 3.0 (+50% linear, ~+3.5 dB). Music now ~-15 dB peak
@@ -324,9 +334,11 @@ def make_cover(image_url, tmp_dir, image_b64=None):
     subprocess.run([
         'ffmpeg', '-y', '-i', src,
         '-vf', (
+            # Stage 1d.4: match the punchier filter applied per beat in the reel.
             'scale=1080:1920:force_original_aspect_ratio=increase,'
             'crop=1080:1920,'
-            'eq=brightness=0.05:saturation=1.1:contrast=1.05'
+            'eq=contrast=1.10:saturation=1.18:gamma=0.96:brightness=0.05,'
+            'unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=1.0'
         ),
         '-q:v', '3', out
     ], capture_output=True, check=True)
@@ -618,14 +630,18 @@ def render_video(img_path, narr_path, narr_duration, content, tmp_dir):
     n_frames = int(BEAT_DUR * FPS)  # frames per beat (fixed 3s each)
 
     # Build 3-beat filter_complex
+    # Stage 1d.4 image filter: punchier source before zoompan (eq contrast/saturation/
+    # gamma) + stronger unsharp after zoompan. Pablo's verdict on Stage 2: "needs filter
+    # for sharpness and color balance" on reels 4 + 5.
     beat_segments = []
     for bi in range(3):
         z, x, y = build_beat_zoompan(bi, n_frames)
         seg = (
             f"[0:v] scale={WORK_W}:{WORK_H}:force_original_aspect_ratio=increase:flags=lanczos,"
             f"crop={WORK_W}:{WORK_H},"
+            f"eq=contrast=1.10:saturation=1.18:gamma=0.96:brightness=0.02,"
             f"zoompan=z={z}:x={x}:y={y}:d={n_frames}:s=1080x1920:fps={FPS},"
-            f"unsharp=luma_msize_x=3:luma_msize_y=3:luma_amount=0.6"
+            f"unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=1.2"
             f" [b{bi}]"
         )
         beat_segments.append(seg)
@@ -752,25 +768,36 @@ def render_video(img_path, narr_path, narr_duration, content, tmp_dir):
     narr_fade_out  = max(narr_duration - 0.4, 0.0)
     narr_input_idx = 3 if has_logo else 2
 
+    # Stage 1d.4: sidechain ducking on the bed. Pablo's verdict on Stage 2 (after
+    # 0.07→0.18→2.0→3.0 boosts) — bed still inaudible. The cause is phone-speaker
+    # dynamic-range compression: a static mix where voice dominates by 10+ dB makes
+    # the bed disappear regardless of absolute level. Fix: run the bed LOUD at base
+    # (volume=5.0, peak ~-10.5 dB) but compress it via sidechaincompress keyed to
+    # the voice signal. Bed pulls down ~8 dB whenever voice is loud, releases over
+    # 300 ms when voice stops. Effect on a phone: bed is clearly audible in the
+    # micro-pauses between words and at start/end, voice stays clean during speech.
     fc_parts.append(
-        # Stage 1d.3: Pablo's verdict on 1d.2 — bed audible but "barely", asked for
-        # +50% louder. 1d.2 was at volume=2.0 → bumped to volume=3.0 here (+50% linear
-        # gain, ~+3.5 dB on top). Music now lands ~-26 dB mean / ~-15 dB peak; voice
-        # peaks ~-5 dB → ~10 dB voice-over-bed (slightly under the 12-16 dB target,
-        # but Pablo's call to prioritise audibility over hard ducking).
-        # See Stage 1d.2 header for bed.wav source-level analysis (-44 LUFS integrated).
         f"[1:a] atrim=0:{total_dur},asetpts=PTS-STARTPTS,"
-        f"volume=3.0,"
+        f"volume=5.0,"
         f"afade=t=in:st=0:d=0.8,"
-        f"afade=t=out:st={music_fade_out:.2f}:d=1.4 [music]"
+        f"afade=t=out:st={music_fade_out:.2f}:d=1.4 [music_raw]"
     )
     fc_parts.append(
         f"[{narr_input_idx}:a] volume=1.0,"
         f"afade=t=in:st=0:d=0.15,"
         f"afade=t=out:st={narr_fade_out:.2f}:d=0.4 [narr]"
     )
+    # Split voice: one copy drives the sidechain key, the other goes into the mix.
+    fc_parts.append("[narr] asplit=2 [narr_main][narr_sc]")
+    # Duck the bed when voice exceeds ~-26 dB. ratio=8 is aggressive but musical.
+    # attack=10ms grabs the bed quickly when voice starts; release=300ms eases it back
+    # gradually so transitions don't feel pumped.
     fc_parts.append(
-        "[music][narr] amix=inputs=2:duration=first:normalize=0 [audio]"
+        "[music_raw][narr_sc] sidechaincompress="
+        "threshold=0.05:ratio=8:attack=10:release=300:makeup=1:level_sc=1.0 [music_ducked]"
+    )
+    fc_parts.append(
+        "[music_ducked][narr_main] amix=inputs=2:duration=first:normalize=0 [audio]"
     )
 
     filter_complex = '; '.join(fc_parts)
@@ -866,7 +893,7 @@ def main():
     callback_url = job.get('callback_url', '')
     n8n_token    = os.environ.get('N8N_CALLBACK_TOKEN', '')
 
-    print(f'=== PuroMMA Render Pipeline (Stage 1d.3) ===')
+    print(f'=== PuroMMA Render Pipeline (Stage 1d.4) ===')
     print(f'  job_id: {job_id}')
     print(f'  post_title: {post_title[:80]}')
     print(f'  content_type: {content_type}')
@@ -944,7 +971,7 @@ def main():
         ig_caption = content.get('ig_caption', post_title)
 
         summary_lines = [
-            '## PuroMMA Render Complete (Stage 1d.3)',
+            '## PuroMMA Render Complete (Stage 1d.4)',
             f'- **Job ID:** {job_id}',
             f'- **Fighter:** {content.get("fighter_name", "?")}',
             f'- **Hook:** {content.get("hook_text", "?")}',
