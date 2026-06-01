@@ -13,6 +13,13 @@ Stage 1d.4 polish vs 1d.3 (Pablo's verdict on Stage 2 batch):
 - Image filter: punchier source via eq (contrast=1.10, saturation=1.18, gamma=0.96,
   brightness=0.02) applied before zoompan; stronger unsharp after zoompan
   (luma_msize=5, luma_amount=1.2). Cover image gets the same treatment.
+- NEW: Kie.ai (nano-banana-2) img2img style pass on the WP photo before render.
+  Replaces FFmpeg eq/unsharp as the primary look — model takes the raw WP photo as
+  a reference and re-photographs it in PuroMMA editorial style (chiaroscuro lighting,
+  blue/red venue bokeh, 9:16, clean lower-third for caption overlay). FFmpeg eq +
+  unsharp still applied on top of the styled image. Falls back gracefully to the
+  raw WP photo when KIE_API_KEY is missing or the API call fails. ~$0.08/image at
+  1K resolution. Payload can opt out with "use_kie_style": false.
 
 Stage 1d.3 polish vs 1d.2 (Pablo's verdict on reel DY635FYDwNH):
 - Bed bumped from volume=2.0 → 3.0 (+50% linear, ~+3.5 dB). Music now ~-15 dB peak
@@ -60,6 +67,17 @@ R2_BUCKET       = os.environ['R2_BUCKET_NAME']     # playon-reels
 R2_PUBLIC_URL   = os.environ['R2_PUBLIC_URL']      # https://pub-xxx.r2.dev
 # R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY are used by aws-cli via env vars
 # (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY — set in GH Actions env block)
+
+# Kie.ai (Nano Banana 2 — Gemini 3.1 Flash Image) for img2img re-styling of the WP
+# featured photo before render. Optional — pipeline falls back to the raw WP photo
+# if the key is missing or the call fails.
+KIE_API_KEY     = os.environ.get('KIE_API_KEY', '')
+KIE_API_BASE    = 'https://api.kie.ai/api/v1/jobs'
+KIE_MODEL       = 'nano-banana-2'
+KIE_RESOLUTION  = '1K'
+KIE_ASPECT      = '9:16'
+KIE_POLL_INTERVAL = 5     # seconds between getTaskStatus polls
+KIE_POLL_TIMEOUT  = 180   # give up after this many seconds
 
 GEMINI_FLASH    = 'gemini-3-flash-preview'
 GEMINI_TTS_MODEL = 'gemini-3.1-flash-tts-preview'
@@ -219,6 +237,99 @@ def ffprobe_image_dims(path):
     )
     s = json.loads(r.stdout)['streams'][0]
     return int(s['width']), int(s['height'])
+
+
+# ── Kie.ai img2img style pass (Nano Banana 2) ─────────────────────────────────
+
+PUROMMA_STYLE_PROMPT = (
+    "Re-render this reference photo as a PuroMMA editorial MMA cover shot. Keep the "
+    "subject's identity, face, pose, clothing, and physical features IDENTICAL — "
+    "this is a stylistic re-photograph, not a re-imagining of the person.\n\n"
+    "Style:\n"
+    "- Cinematic chiaroscuro lighting, dramatic rim light from one side\n"
+    "- Deep moody shadows on the off-side of the face, sculpting the jawline\n"
+    "- Ambient venue spotlights bleeding into the background: cool blue and "
+    "crimson red, blurred bokeh, NOT in focus\n"
+    "- Shot on Phase One XF or Canon R5, 85mm prime, f/2.0, shallow depth of field\n"
+    "- Razor-sharp focus on the eyes; pores, stubble, sweat micro-detail visible\n"
+    "- Desaturated warm skin tones, deep true blacks, restrained palette\n"
+    "- Subtle 35mm film grain — texture not noise\n"
+    "- Aesthetic references: Sports Illustrated cover, Esquire, GQ, ESPN The "
+    "Magazine — editorial sports portrait, not fight-still or meme\n\n"
+    "Composition:\n"
+    "- 9:16 vertical, 1080x1920\n"
+    "- Subject occupies the upper two thirds of the frame\n"
+    "- Lower third intentionally clean and low-detail — caption text overlays there\n"
+    "- Tight crop on face and shoulders, not full body\n\n"
+    "Mood: serious, intense, the calm before a fight. Not snarling, not posed. "
+    "The viewer should feel they're looking at someone about to walk to the cage.\n\n"
+    "Hard nos: no text, no logos, no watermarks, no graphic overlays, no extra "
+    "fingers or limbs, no surreal/dreamy elements, no over-saturation, no plastic "
+    "skin, no \"AI look\"."
+)
+
+
+def _kie_request(method, path, body=None):
+    """Authenticated request to Kie.ai. Returns parsed JSON body."""
+    url = f'{KIE_API_BASE}/{path.lstrip("/")}'
+    headers = {'Authorization': f'Bearer {KIE_API_KEY}'}
+    data = None
+    if body is not None:
+        headers['Content-Type'] = 'application/json'
+        data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def apply_image_style(reference_image_url, dest_path, prompt=PUROMMA_STYLE_PROMPT):
+    """Run a Kie.ai nano-banana-2 img2img pass on the WP photo, save to dest_path.
+
+    Returns dest_path on success. On any failure (no key, API error, timeout,
+    download error) prints a diagnostic and raises — caller catches and falls
+    back to the raw WP photo so a styling outage never blocks a render.
+    """
+    if not KIE_API_KEY:
+        raise RuntimeError('KIE_API_KEY not set — skipping style pass')
+
+    create_body = {
+        'model': KIE_MODEL,
+        'input': {
+            'prompt': prompt,
+            'image_input': [reference_image_url],
+            'aspect_ratio': KIE_ASPECT,
+            'resolution': KIE_RESOLUTION,
+            'output_format': 'jpg',
+        },
+    }
+    print(f'  Kie.ai img2img → {KIE_MODEL} @ {KIE_RESOLUTION} {KIE_ASPECT}...')
+    resp = _kie_request('POST', 'createTask', create_body)
+    if resp.get('code') != 200:
+        raise RuntimeError(f'Kie createTask failed: code={resp.get("code")} msg={resp.get("msg")}')
+    task_id = resp['data']['taskId']
+
+    # Poll until success / fail / timeout.
+    deadline = time.time() + KIE_POLL_TIMEOUT
+    while True:
+        if time.time() > deadline:
+            raise RuntimeError(f'Kie task {task_id} timed out after {KIE_POLL_TIMEOUT}s')
+        time.sleep(KIE_POLL_INTERVAL)
+        poll = _kie_request('GET', f'recordInfo?taskId={task_id}')
+        data = poll.get('data') or {}
+        state = data.get('state')
+        if state == 'success':
+            credits = data.get('creditsConsumed')
+            cost_time_ms = data.get('costTime')
+            print(f'  Kie task done in ~{cost_time_ms}ms, {credits} credits')
+            result_json = data.get('resultJson') or '{}'
+            urls = json.loads(result_json).get('resultUrls') or []
+            if not urls:
+                raise RuntimeError(f'Kie task {task_id} success but no resultUrls')
+            download_image(urls[0], dest_path)
+            return dest_path
+        if state == 'fail':
+            raise RuntimeError(f'Kie task {task_id} failed: {data.get("failMsg")}')
+        # state in (waiting, running, processing, ...) → keep polling
 
 
 def sanitise_drawtext(s):
@@ -891,6 +1002,9 @@ def main():
     wp_post_id   = job.get('wp_post_id', '0')
     content_type = job.get('content_type', 'news_hook')
     callback_url = job.get('callback_url', '')
+    # 1d.4: Kie.ai img2img style pass. Default ON when KIE_API_KEY is set;
+    # payload can override with "use_kie_style": false (A/B comparison).
+    use_kie_style = job.get('use_kie_style', bool(KIE_API_KEY))
     n8n_token    = os.environ.get('N8N_CALLBACK_TOKEN', '')
 
     print(f'=== PuroMMA Render Pipeline (Stage 1d.4) ===')
@@ -949,17 +1063,41 @@ def main():
         print(f'  Narration duration: {narr_dur:.2f}s')
 
         # 3. Download fighter image (or decode from base64 if origin blocks runner IPs)
-        img_path = os.path.join(tmp_dir, 'fighter.jpg')
+        raw_img_path = os.path.join(tmp_dir, 'fighter_raw.jpg')
         if image_b64:
             print(f'  Decoding image from base64 payload ({len(image_b64)} chars)...')
         else:
             print(f'  Downloading image: {image_url[:80]}...')
-        download_image(image_url, img_path, image_b64=image_b64)
+        download_image(image_url, raw_img_path, image_b64=image_b64)
+
+        # 3b. Stage 1d.4: Kie.ai nano-banana-2 img2img style pass on the WP photo.
+        # The styled image replaces the raw WP photo as the render source. Cover
+        # image continues to use the raw WP photo (smaller asset, IG container
+        # uses it as a fallback poster only). Fails open: any styling error logs
+        # a diagnostic and falls back to the raw photo so styling never blocks.
+        img_path = raw_img_path
+        if use_kie_style:
+            styled_path = os.path.join(tmp_dir, 'fighter_styled.jpg')
+            try:
+                # Pass the public WP URL when available — Kie.ai fetches directly,
+                # saves us re-uploading bytes. Only fall back to base64 if we had
+                # to use the b64 fallback path upstream.
+                kie_input = image_url if image_url else None
+                if kie_input:
+                    apply_image_style(kie_input, styled_path)
+                    img_path = styled_path
+                    print(f'  Using Kie-styled image as render source: {img_path}')
+                else:
+                    print('  Skipping Kie style pass: no public image_url to feed Kie')
+            except Exception as e:
+                print(f'  Kie style pass FAILED — falling back to raw WP photo: {e}')
+        else:
+            print('  Kie style pass disabled by payload (use_kie_style=false)')
 
         # 4. Render video (voice-synced captions, no CTA card)
         mp4_path, video_dur = render_video(img_path, narr_path, narr_dur, content, tmp_dir)
 
-        # 5. Cover image
+        # 5. Cover image — keep the raw WP photo for the cover regardless of styling
         print('  Generating cover...')
         cover_path = make_cover(image_url, tmp_dir, image_b64=image_b64)
 

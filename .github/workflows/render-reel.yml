@@ -28,6 +28,7 @@ jobs:
       - name: Run render pipeline
         env:
           GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
+          KIE_API_KEY:          ${{ secrets.KIE_API_KEY }}
           R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
