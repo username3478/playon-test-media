@@ -380,6 +380,31 @@ def spell_event_numbers_for_tts(text):
 
 # ── Content generation ────────────────────────────────────────────────────────
 
+# Task #486: per-content-type angle instructions injected into the Gemini prompt.
+# Types come from the creative spec (work/playon/ig-rework-creative-spec-max-2026-05-25.md):
+# Type C = spain_identity, Type A = evergreen, Type D = fight_week, default = news_hook.
+CONTENT_TYPE_ANGLES = {
+    'news_hook': (
+        'Hot news take. Open a curiosity gap or deliver a hot take on the freshest '
+        'angle in the article.'
+    ),
+    'spain_identity': (
+        'Spain-identity piece (Type C). State the Spain frame immediately — what this '
+        'fighter/event means for MMA in Spain ("el MMA en España"). This angle is the '
+        "account's strongest differentiator vs LatAm MMA accounts; talk to Spanish fans "
+        'as fellow fans who feel seen.'
+    ),
+    'evergreen': (
+        'Durable analysis piece. No perishable framing (no "esta semana", no countdown '
+        'language) — the take must still read well in six months.'
+    ),
+    'fight_week': (
+        'Fight-week preview. Urgency around the upcoming event: stakes, matchup, why it '
+        'matters now.'
+    ),
+}
+
+
 def generate_content(post_title, image_url, content_type='news_hook'):
     """Call Gemini to produce structured content for the reel.
 
@@ -387,6 +412,7 @@ def generate_content(post_title, image_url, content_type='news_hook'):
       fighter_name, hook_text, body_beat_1, body_beat_2,
       voiceover, ig_caption
     """
+    angle = CONTENT_TYPE_ANGLES.get(content_type, CONTENT_TYPE_ANGLES['news_hook'])
     prompt = f"""You are a social-media content writer for PuroMMA (puromma.com),
 a Spanish-language MMA site targeting a peninsular Spanish audience (Spain).
 
@@ -394,7 +420,25 @@ Language: ES-ES peninsular Spanish. Use vosotros/os. Use /θ/ distinction in wri
 (e.g. "veréis", "conocéis"). Never use LatAm "ustedes" as default second person plural.
 
 Article title: {post_title}
-Content type: {content_type}
+Content type: {content_type} — {angle}
+
+EDITORIAL PRIORITIES (task #486 — apply in this order):
+1. Spain angle first. PuroMMA's audience lives in Spain. If the article involves a
+   Spanish fighter, a Spain-based or Spain-connected fighter, or an event with a Spain
+   connection, lead with that angle — what it means for MMA in Spain.
+   Ilia Topuria: Georgian-born, the favourite of the Spanish public ("el favorito del
+   público español") — the Spain-connected angle is always valid for him, but NEVER
+   state or imply his current belt/title/ranking status unless the article title
+   itself states it.
+2. Current over legacy. Centre current/active fighters. If the article's main subject
+   is a legacy-era name (Conor McGregor, Anderson Silva, GSP, Velasquez, etc.) whose
+   news cycle is repetitive, do NOT make nostalgia the emotional centre — angle the
+   hook and voiceover toward the current/active fighters involved, the divisional
+   implications, or what it means for upcoming events. fighter_name may still be the
+   legacy name if the article is unavoidably about them, but the take must feel
+   current, not nostalgic.
+3. Never invent facts. Use only what the article title supports. No invented records,
+   belts, dates, quotes or rankings.
 
 Return ONLY valid JSON with exactly these keys:
 
